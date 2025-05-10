@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import asyncio
+from contextlib import asynccontextmanager
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -26,6 +28,7 @@ from typing import Any
 from typing import List
 from typing import Literal
 from typing import Optional
+from typing import Union
 
 import click
 from fastapi import FastAPI
@@ -50,17 +53,21 @@ from pydantic import ValidationError
 from starlette.types import Lifespan
 
 from ..agents import RunConfig
+from ..agents.base_agent import BaseAgent
 from ..agents.live_request_queue import LiveRequest
 from ..agents.live_request_queue import LiveRequestQueue
 from ..agents.llm_agent import Agent
+from ..agents.llm_agent import LlmAgent
 from ..agents.run_config import StreamingMode
 from ..artifacts import InMemoryArtifactService
 from ..events.event import Event
+from ..memory.in_memory_memory_service import InMemoryMemoryService
 from ..runners import Runner
 from ..sessions.database_session_service import DatabaseSessionService
 from ..sessions.in_memory_session_service import InMemorySessionService
 from ..sessions.session import Session
 from ..sessions.vertex_ai_session_service import VertexAiSessionService
+from ..tools.base_toolset import BaseToolset
 from .cli_eval import EVAL_SESSION_ID_PREFIX
 from .cli_eval import EvalMetric
 from .cli_eval import EvalMetricResult
@@ -143,11 +150,8 @@ def get_fast_api_app(
   provider.add_span_processor(
       export.SimpleSpanProcessor(ApiServerSpanExporter(trace_dict))
   )
-  envs.load_dotenv()
-  enable_cloud_tracing = trace_to_cloud or os.environ.get(
-      "ADK_TRACE_TO_CLOUD", "0"
-  ).lower() in ["1", "true"]
-  if enable_cloud_tracing:
+  if trace_to_cloud:
+    envs.load_dotenv_for_agent("", agent_dir)
     if project_id := os.environ.get("GOOGLE_CLOUD_PROJECT", None):
       processor = export.BatchSpanProcessor(
           CloudTraceSpanExporter(project_id=project_id)
@@ -161,8 +165,25 @@ def get_fast_api_app(
 
   trace.set_tracer_provider(provider)
 
+  exit_stacks = []
+  toolsets_to_close: set[BaseToolset] = set()
+
+  @asynccontextmanager
+  async def internal_lifespan(app: FastAPI):
+    if lifespan:
+      async with lifespan(app) as lifespan_context:
+        yield
+
+        if exit_stacks:
+          for stack in exit_stacks:
+            await stack.aclose()
+        for toolset in toolsets_to_close:
+          await toolset.close()
+    else:
+      yield
+
   # Run the FastAPI server.
-  app = FastAPI(lifespan=lifespan)
+  app = FastAPI(lifespan=internal_lifespan)
 
   if allow_origins:
     app.add_middleware(
@@ -181,6 +202,7 @@ def get_fast_api_app(
 
   # Build the Artifact service
   artifact_service = InMemoryArtifactService()
+  memory_service = InMemoryMemoryService()
 
   # Build the Session service
   agent_engine_id = ""
@@ -358,7 +380,7 @@ def get_fast_api_app(
       "/apps/{app_name}/eval_sets/{eval_set_id}/add_session",
       response_model_exclude_none=True,
   )
-  def add_session_to_eval_set(
+  async def add_session_to_eval_set(
       app_name: str, eval_set_id: str, req: AddSessionToEvalSetRequest
   ):
     pattern = r"^[a-zA-Z0-9_]+$"
@@ -393,7 +415,9 @@ def get_fast_api_app(
     test_data = evals.convert_session_to_eval_format(session)
 
     # Populate the session with initial session state.
-    initial_session_state = create_empty_state(_get_root_agent(app_name))
+    initial_session_state = create_empty_state(
+        await _get_root_agent_async(app_name)
+    )
 
     eval_set_data.append({
         "name": req.eval_id,
@@ -430,7 +454,7 @@ def get_fast_api_app(
       "/apps/{app_name}/eval_sets/{eval_set_id}/run_eval",
       response_model_exclude_none=True,
   )
-  def run_eval(
+  async def run_eval(
       app_name: str, eval_set_id: str, req: RunEvalRequest
   ) -> list[RunEvalResult]:
     from .cli_eval import run_evals
@@ -438,6 +462,7 @@ def get_fast_api_app(
     """Runs an eval given the details in the eval request."""
     # Create a mapping from eval set file to all the evals that needed to be
     # run.
+    envs.load_dotenv_for_agent(os.path.basename(app_name), agent_dir)
     eval_set_file_path = _get_eval_set_file_path(
         app_name, agent_dir, eval_set_id
     )
@@ -447,9 +472,17 @@ def get_fast_api_app(
       logger.info(
           "Eval ids to run list is empty. We will all evals in the eval set."
       )
-    root_agent = _get_root_agent(app_name)
-    eval_results = list(
-        run_evals(
+    root_agent = await _get_root_agent_async(app_name)
+    return [
+        RunEvalResult(
+            app_name=app_name,
+            eval_set_id=eval_set_id,
+            eval_id=eval_result.eval_id,
+            final_eval_status=eval_result.final_eval_status,
+            eval_metric_results=eval_result.eval_metric_results,
+            session_id=eval_result.session_id,
+        )
+        async for eval_result in run_evals(
             eval_set_to_evals,
             root_agent,
             getattr(root_agent, "reset_data", None),
@@ -457,21 +490,7 @@ def get_fast_api_app(
             session_service=session_service,
             artifact_service=artifact_service,
         )
-    )
-
-    run_eval_results = []
-    for eval_result in eval_results:
-      run_eval_results.append(
-          RunEvalResult(
-              app_name=app_name,
-              eval_set_id=eval_set_id,
-              eval_id=eval_result.eval_id,
-              final_eval_status=eval_result.final_eval_status,
-              eval_metric_results=eval_result.eval_metric_results,
-              session_id=eval_result.session_id,
-          )
-      )
-    return run_eval_results
+    ]
 
   @app.delete("/apps/{app_name}/users/{user_id}/sessions/{session_id}")
   def delete_session(app_name: str, user_id: str, session_id: str):
@@ -485,7 +504,7 @@ def get_fast_api_app(
       "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}",
       response_model_exclude_none=True,
   )
-  def load_artifact(
+  async def load_artifact(
       app_name: str,
       user_id: str,
       session_id: str,
@@ -493,7 +512,7 @@ def get_fast_api_app(
       version: Optional[int] = Query(None),
   ) -> Optional[types.Part]:
     app_name = agent_engine_id if agent_engine_id else app_name
-    artifact = artifact_service.load_artifact(
+    artifact = await artifact_service.load_artifact(
         app_name=app_name,
         user_id=user_id,
         session_id=session_id,
@@ -508,7 +527,7 @@ def get_fast_api_app(
       "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}/versions/{version_id}",
       response_model_exclude_none=True,
   )
-  def load_artifact_version(
+  async def load_artifact_version(
       app_name: str,
       user_id: str,
       session_id: str,
@@ -516,7 +535,7 @@ def get_fast_api_app(
       version_id: int,
   ) -> Optional[types.Part]:
     app_name = agent_engine_id if agent_engine_id else app_name
-    artifact = artifact_service.load_artifact(
+    artifact = await artifact_service.load_artifact(
         app_name=app_name,
         user_id=user_id,
         session_id=session_id,
@@ -531,11 +550,11 @@ def get_fast_api_app(
       "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts",
       response_model_exclude_none=True,
   )
-  def list_artifact_names(
+  async def list_artifact_names(
       app_name: str, user_id: str, session_id: str
   ) -> list[str]:
     app_name = agent_engine_id if agent_engine_id else app_name
-    return artifact_service.list_artifact_keys(
+    return await artifact_service.list_artifact_keys(
         app_name=app_name, user_id=user_id, session_id=session_id
     )
 
@@ -543,11 +562,11 @@ def get_fast_api_app(
       "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}/versions",
       response_model_exclude_none=True,
   )
-  def list_artifact_versions(
+  async def list_artifact_versions(
       app_name: str, user_id: str, session_id: str, artifact_name: str
   ) -> list[int]:
     app_name = agent_engine_id if agent_engine_id else app_name
-    return artifact_service.list_versions(
+    return await artifact_service.list_versions(
         app_name=app_name,
         user_id=user_id,
         session_id=session_id,
@@ -557,11 +576,11 @@ def get_fast_api_app(
   @app.delete(
       "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}",
   )
-  def delete_artifact(
+  async def delete_artifact(
       app_name: str, user_id: str, session_id: str, artifact_name: str
   ):
     app_name = agent_engine_id if agent_engine_id else app_name
-    artifact_service.delete_artifact(
+    await artifact_service.delete_artifact(
         app_name=app_name,
         user_id=user_id,
         session_id=session_id,
@@ -577,7 +596,7 @@ def get_fast_api_app(
     )
     if not session:
       raise HTTPException(status_code=404, detail="Session not found")
-    runner = _get_runner(req.app_name)
+    runner = await _get_runner_async(req.app_name)
     events = [
         event
         async for event in runner.run_async(
@@ -604,7 +623,7 @@ def get_fast_api_app(
     async def event_generator():
       try:
         stream_mode = StreamingMode.SSE if req.streaming else StreamingMode.NONE
-        runner = _get_runner(req.app_name)
+        runner = await _get_runner_async(req.app_name)
         async for event in runner.run_async(
             user_id=req.user_id,
             session_id=req.session_id,
@@ -630,7 +649,7 @@ def get_fast_api_app(
       "/apps/{app_name}/users/{user_id}/sessions/{session_id}/events/{event_id}/graph",
       response_model_exclude_none=True,
   )
-  def get_event_graph(
+  async def get_event_graph(
       app_name: str, user_id: str, session_id: str, event_id: str
   ):
     # Connect to managed session if agent_engine_id is set.
@@ -647,7 +666,7 @@ def get_fast_api_app(
 
     function_calls = event.get_function_calls()
     function_responses = event.get_function_responses()
-    root_agent = _get_root_agent(app_name)
+    root_agent = await _get_root_agent_async(app_name)
     dot_graph = None
     if function_calls:
       function_call_highlights = []
@@ -655,7 +674,7 @@ def get_fast_api_app(
         from_name = event.author
         to_name = function_call.name
         function_call_highlights.append((from_name, to_name))
-        dot_graph = agent_graph.get_agent_graph(
+        dot_graph = await agent_graph.get_agent_graph(
             root_agent, function_call_highlights
         )
     elif function_responses:
@@ -664,13 +683,13 @@ def get_fast_api_app(
         from_name = function_response.name
         to_name = event.author
         function_responses_highlights.append((from_name, to_name))
-        dot_graph = agent_graph.get_agent_graph(
+        dot_graph = await agent_graph.get_agent_graph(
             root_agent, function_responses_highlights
         )
     else:
       from_name = event.author
       to_name = ""
-      dot_graph = agent_graph.get_agent_graph(
+      dot_graph = await agent_graph.get_agent_graph(
           root_agent, [(from_name, to_name)]
       )
     if dot_graph and isinstance(dot_graph, graphviz.Digraph):
@@ -704,7 +723,7 @@ def get_fast_api_app(
     live_request_queue = LiveRequestQueue()
 
     async def forward_events():
-      runner = _get_runner(app_name)
+      runner = await _get_runner_async(app_name)
       async for event in runner.run_live(
           session=session, live_request_queue=live_request_queue
       ):
@@ -738,30 +757,61 @@ def get_fast_api_app(
     except Exception as e:
       logger.exception("Error during live websocket communication: %s", e)
       traceback.print_exc()
+      WEBSOCKET_INTERNAL_ERROR_CODE = 1011
+      WEBSOCKET_MAX_BYTES_FOR_REASON = 123
+      await websocket.close(
+          code=WEBSOCKET_INTERNAL_ERROR_CODE,
+          reason=str(e)[:WEBSOCKET_MAX_BYTES_FOR_REASON],
+      )
     finally:
       for task in pending:
         task.cancel()
 
-  def _get_root_agent(app_name: str) -> Agent:
+  def _get_all_toolsets(agent: BaseAgent) -> set[BaseToolset]:
+    toolsets = set()
+    if isinstance(agent, LlmAgent):
+      for tool_union in agent.tools:
+        if isinstance(tool_union, BaseToolset):
+          toolsets.add(tool_union)
+    for sub_agent in agent.sub_agents:
+      toolsets.update(_get_all_toolsets(sub_agent))
+    return toolsets
+
+  async def _get_root_agent_async(app_name: str) -> Agent:
     """Returns the root agent for the given app."""
     if app_name in root_agent_dict:
       return root_agent_dict[app_name]
-    envs.load_dotenv_for_agent(os.path.basename(app_name), agent_dir)
     agent_module = importlib.import_module(app_name)
-    root_agent: Agent = agent_module.agent.root_agent
+    if getattr(agent_module.agent, "root_agent"):
+      root_agent = agent_module.agent.root_agent
+    else:
+      raise ValueError(f'Unable to find "root_agent" from {app_name}.')
+
+    # Handle an awaitable root agent and await for the actual agent.
+    if inspect.isawaitable(root_agent):
+      try:
+        agent, exit_stack = await root_agent
+        exit_stacks.append(exit_stack)
+        root_agent = agent
+      except Exception as e:
+        raise RuntimeError(f"error getting root agent, {e}") from e
+
     root_agent_dict[app_name] = root_agent
+    toolsets_to_close.update(_get_all_toolsets(root_agent))
     return root_agent
 
-  def _get_runner(app_name: str) -> Runner:
+  async def _get_runner_async(app_name: str) -> Runner:
     """Returns the runner for the given app."""
+    envs.load_dotenv_for_agent(os.path.basename(app_name), agent_dir)
     if app_name in runner_dict:
       return runner_dict[app_name]
-    root_agent = _get_root_agent(app_name)
+    root_agent = await _get_root_agent_async(app_name)
     runner = Runner(
         app_name=agent_engine_id if agent_engine_id else app_name,
         agent=root_agent,
         artifact_service=artifact_service,
         session_service=session_service,
+        memory_service=memory_service,
     )
     runner_dict[app_name] = runner
     return runner

@@ -32,7 +32,7 @@ class EvaluationGenerator:
   """Generates evaluation responses for agents."""
 
   @staticmethod
-  def generate_responses(
+  async def generate_responses(
       eval_dataset,
       agent_module_path,
       repeat_num=3,
@@ -42,10 +42,10 @@ class EvaluationGenerator:
     """Returns evaluation responses for the given dataset and agent.
 
     Args:
-      eval_dataset: The dataset that needs to be scraped for resposnes.
+      eval_dataset: The dataset that needs to be scraped for responses.
       agent_module_path: Path to the module that contains the root agent.
       repeat_num: Number of time the eval dataset should be repeated. This is
-        usually done to remove uncertainity that a single run may bring.
+        usually done to remove uncertainty that a single run may bring.
       agent_name: The name of the agent that should be evaluated. This is
         usually the sub-agent.
       initial_session: Initial session for the eval data.
@@ -107,7 +107,7 @@ class EvaluationGenerator:
     )
 
   @staticmethod
-  def _process_query_with_root_agent(
+  async def _process_query_with_root_agent(
       data,
       root_agent,
       reset_func,
@@ -128,7 +128,7 @@ class EvaluationGenerator:
           all_mock_tools.add(expected[EvalConstants.TOOL_NAME])
 
     eval_data_copy = data.copy()
-    EvaluationGenerator.apply_before_tool_callback(
+    await EvaluationGenerator.apply_before_tool_callback(
         root_agent,
         lambda *args: EvaluationGenerator.before_tool_callback(
             *args, eval_dataset=eval_data_copy
@@ -247,24 +247,24 @@ class EvaluationGenerator:
     return None
 
   @staticmethod
-  def apply_before_tool_callback(
+  async def apply_before_tool_callback(
       agent: BaseAgent,
       callback: BeforeToolCallback,
       all_mock_tools: set[str],
   ):
     """Recursively apply the before_tool_callback to the root agent and all its subagents."""
-    # check if the agent has tools that defined by evalset
-    # We use function name to check if tools match
+    # Check if the agent has tools that are defined by evalset.
+    # We use function names to check if tools match
     if not isinstance(agent, Agent) and not isinstance(agent, LlmAgent):
       return
 
-    for tool in agent.canonical_tools:
+    for tool in await agent.canonical_tools():
       tool_name = tool.name
       if tool_name in all_mock_tools:
         agent.before_tool_callback = callback
 
     # Apply recursively to subagents if they exist
     for sub_agent in agent.sub_agents:
-      EvaluationGenerator.apply_before_tool_callback(
+      await EvaluationGenerator.apply_before_tool_callback(
           sub_agent, callback, all_mock_tools
       )

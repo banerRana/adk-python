@@ -45,10 +45,9 @@ class AgentTool(BaseTool):
     skip_summarization: Whether to skip summarization of the agent output.
   """
 
-  def __init__(self, agent: BaseAgent):
+  def __init__(self, agent: BaseAgent, skip_summarization: bool = False):
     self.agent = agent
-    self.skip_summarization: bool = False
-    """Whether to skip summarization of the agent output."""
+    self.skip_summarization: bool = skip_summarization
 
     super().__init__(name=agent.name, description=agent.description)
 
@@ -147,18 +146,21 @@ class AgentTool(BaseTool):
 
     if runner.artifact_service:
       # Forward all artifacts to parent session.
-      for artifact_name in runner.artifact_service.list_artifact_keys(
+      artifact_names = await runner.artifact_service.list_artifact_keys(
           app_name=session.app_name,
           user_id=session.user_id,
           session_id=session.id,
-      ):
-        if artifact := runner.artifact_service.load_artifact(
+      )
+      for artifact_name in artifact_names:
+        if artifact := await runner.artifact_service.load_artifact(
             app_name=session.app_name,
             user_id=session.user_id,
             session_id=session.id,
             filename=artifact_name,
         ):
-          tool_context.save_artifact(filename=artifact_name, artifact=artifact)
+          await tool_context.save_artifact(
+              filename=artifact_name, artifact=artifact
+          )
 
     if (
         not last_event

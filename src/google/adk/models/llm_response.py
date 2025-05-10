@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from google.genai import types
 from pydantic import BaseModel
@@ -37,10 +37,11 @@ class LlmResponse(BaseModel):
     error_message: Error message if the response is an error.
     interrupted: Flag indicating that LLM was interrupted when generating the
       content. Usually it's due to user interruption during a bidi streaming.
+    custom_metadata: The custom metadata of the LlmResponse.
   """
 
   model_config = ConfigDict(extra='forbid')
-  """The model config."""
+  """The pydantic model config."""
 
   content: Optional[types.Content] = None
   """The content of the response."""
@@ -69,6 +70,14 @@ class LlmResponse(BaseModel):
   interrupted: Optional[bool] = None
   """Flag indicating that LLM was interrupted when generating the content.
   Usually it's due to user interruption during a bidi streaming.
+  """
+
+  custom_metadata: Optional[dict[str, Any]] = None
+  """The custom metadata of the LlmResponse.
+
+  An optional key-value pair to label an LlmResponse.
+
+  NOTE: the entire dict must be JSON serializable.
   """
 
   @staticmethod

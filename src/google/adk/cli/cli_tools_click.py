@@ -18,12 +18,15 @@ from datetime import datetime
 import logging
 import os
 import tempfile
+from typing import AsyncGenerator
+from typing import Coroutine
 from typing import Optional
 
 import click
 from fastapi import FastAPI
 import uvicorn
 
+from . import cli_create
 from . import cli_deploy
 from .cli import run_cli
 from .cli_eval import MISSING_EVAL_DEPENDENCIES_MESSAGE
@@ -42,8 +45,74 @@ def main():
 
 @main.group()
 def deploy():
-  """Deploy Agent."""
+  """Deploys agent to hosted environments."""
   pass
+
+
+@main.command("create")
+@click.option(
+    "--model",
+    type=str,
+    help="Optional. The model used for the root agent.",
+)
+@click.option(
+    "--api_key",
+    type=str,
+    help=(
+        "Optional. The API Key needed to access the model, e.g. Google AI API"
+        " Key."
+    ),
+)
+@click.option(
+    "--project",
+    type=str,
+    help="Optional. The Google Cloud Project for using VertexAI as backend.",
+)
+@click.option(
+    "--region",
+    type=str,
+    help="Optional. The Google Cloud Region for using VertexAI as backend.",
+)
+@click.argument("app_name", type=str, required=True)
+def cli_create_cmd(
+    app_name: str,
+    model: Optional[str],
+    api_key: Optional[str],
+    project: Optional[str],
+    region: Optional[str],
+):
+  """Creates a new app in the current folder with prepopulated agent template.
+
+  APP_NAME: required, the folder of the agent source code.
+
+  Example:
+
+    adk create path/to/my_app
+  """
+  cli_create.run_cmd(
+      app_name,
+      model=model,
+      google_api_key=api_key,
+      google_cloud_project=project,
+      google_cloud_region=region,
+  )
+
+
+def validate_exclusive(ctx, param, value):
+  # Store the validated parameters in the context
+  if not hasattr(ctx, "exclusive_opts"):
+    ctx.exclusive_opts = {}
+
+  # If this option has a value and we've already seen another exclusive option
+  if value is not None and any(ctx.exclusive_opts.values()):
+    exclusive_opt = next(key for key, val in ctx.exclusive_opts.items() if val)
+    raise click.UsageError(
+        f"Options '{param.name}' and '{exclusive_opt}' cannot be set together."
+    )
+
+  # Record this option's value
+  ctx.exclusive_opts[param.name] = value is not None
+  return value
 
 
 @main.command("run")
@@ -55,14 +124,54 @@ def deploy():
     default=False,
     help="Optional. Whether to save the session to a json file on exit.",
 )
+@click.option(
+    "--session_id",
+    type=str,
+    help=(
+        "Optional. The session ID to save the session to on exit when"
+        " --save_session is set to true. User will be prompted to enter a"
+        " session ID if not set."
+    ),
+)
+@click.option(
+    "--replay",
+    type=click.Path(
+        exists=True, dir_okay=False, file_okay=True, resolve_path=True
+    ),
+    help=(
+        "The json file that contains the initial state of the session and user"
+        " queries. A new session will be created using this state. And user"
+        " queries are run againt the newly created session. Users cannot"
+        " continue to interact with the agent."
+    ),
+    callback=validate_exclusive,
+)
+@click.option(
+    "--resume",
+    type=click.Path(
+        exists=True, dir_okay=False, file_okay=True, resolve_path=True
+    ),
+    help=(
+        "The json file that contains a previously saved session (by"
+        "--save_session option). The previous session will be re-displayed. And"
+        " user can continue to interact with the agent."
+    ),
+    callback=validate_exclusive,
+)
 @click.argument(
     "agent",
     type=click.Path(
         exists=True, dir_okay=True, file_okay=False, resolve_path=True
     ),
 )
-def cli_run(agent: str, save_session: bool):
-  """Run an interactive CLI for a certain agent.
+def cli_run(
+    agent: str,
+    save_session: bool,
+    session_id: Optional[str],
+    replay: Optional[str],
+    resume: Optional[str],
+):
+  """Runs an interactive CLI for a certain agent.
 
   AGENT: The path to the agent source code folder.
 
@@ -79,7 +188,10 @@ def cli_run(agent: str, save_session: bool):
       run_cli(
           agent_parent_dir=agent_parent_folder,
           agent_folder_name=agent_folder_name,
+          input_file=replay,
+          saved_session_file=resume,
           save_session=save_session,
+          session_id=session_id,
       )
   )
 
@@ -157,14 +269,23 @@ def cli_eval(
 
   eval_set_to_evals = parse_and_get_evals_to_run(eval_set_file_path)
 
+  async def _collect_async_gen(
+      async_gen_coroutine: Coroutine[
+          AsyncGenerator[EvalResult, None], None, None
+      ],
+  ) -> list[EvalResult]:
+    return [result async for result in async_gen_coroutine]
+
   try:
-    eval_results = list(
-        run_evals(
-            eval_set_to_evals,
-            root_agent,
-            reset_func,
-            eval_metrics,
-            print_detailed_results=print_detailed_results,
+    eval_results = asyncio.run(
+        _collect_async_gen(
+            run_evals(
+                eval_set_to_evals,
+                root_agent,
+                reset_func,
+                eval_metrics,
+                print_detailed_results=print_detailed_results,
+            )
         )
     )
   except ModuleNotFoundError:
@@ -195,12 +316,13 @@ def cli_eval(
 @click.option(
     "--session_db_url",
     help=(
-        "Optional. The database URL to store the session.\n\n  - Use"
-        " 'agentengine://<agent_engine_resource_id>' to connect to Vertex"
-        " managed session service.\n\n  - Use 'sqlite://<path_to_sqlite_file>'"
-        " to connect to a SQLite DB.\n\n  - See"
-        " https://docs.sqlalchemy.org/en/20/core/engines.html#backend-specific-urls"
-        " for more details on supported DB URLs."
+        """Optional. The database URL to store the session.
+
+  - Use 'agentengine://<agent_engine_resource_id>' to connect to Agent Engine sessions.
+
+  - Use 'sqlite://<path_to_sqlite_file>' to connect to a SQLite DB.
+
+  - See https://docs.sqlalchemy.org/en/20/core/engines.html#backend-specific-urls for more details on supported DB URLs."""
     ),
 )
 @click.option(
@@ -239,12 +361,17 @@ def cli_eval(
     default=False,
     help="Optional. Whether to enable cloud trace for telemetry.",
 )
+@click.option(
+    "--reload/--no-reload",
+    default=True,
+    help="Optional. Whether to enable auto reload for server.",
+)
 @click.argument(
     "agents_dir",
     type=click.Path(
         exists=True, dir_okay=True, file_okay=False, resolve_path=True
     ),
-    default=os.getcwd(),
+    default=os.getcwd,
 )
 def cli_web(
     agents_dir: str,
@@ -254,8 +381,9 @@ def cli_web(
     allow_origins: Optional[list[str]] = None,
     port: int = 8000,
     trace_to_cloud: bool = False,
+    reload: bool = True,
 ):
-  """Start a FastAPI server with Web UI for agents.
+  """Starts a FastAPI server with Web UI for agents.
 
   AGENTS_DIR: The directory of agents, where each sub-directory is a single
   agent, containing at least `__init__.py` and `agent.py` files.
@@ -274,7 +402,7 @@ def cli_web(
   @asynccontextmanager
   async def _lifespan(app: FastAPI):
     click.secho(
-        f"""\
+        f"""
 +-----------------------------------------------------------------------------+
 | ADK Web Server started                                                      |
 |                                                                             |
@@ -285,7 +413,7 @@ def cli_web(
     )
     yield  # Startup is done, now app is running
     click.secho(
-        """\
+        """
 +-----------------------------------------------------------------------------+
 | ADK Web Server shutting down...                                             |
 +-----------------------------------------------------------------------------+
@@ -305,7 +433,7 @@ def cli_web(
       app,
       host="0.0.0.0",
       port=port,
-      reload=True,
+      reload=reload,
   )
 
   server = uvicorn.Server(config)
@@ -316,12 +444,13 @@ def cli_web(
 @click.option(
     "--session_db_url",
     help=(
-        "Optional. The database URL to store the session.\n\n  - Use"
-        " 'agentengine://<agent_engine_resource_id>' to connect to Vertex"
-        " managed session service.\n\n  - Use 'sqlite://<path_to_sqlite_file>'"
-        " to connect to a SQLite DB.\n\n  - See"
-        " https://docs.sqlalchemy.org/en/20/core/engines.html#backend-specific-urls"
-        " for more details on supported DB URLs."
+        """Optional. The database URL to store the session.
+
+  - Use 'agentengine://<agent_engine_resource_id>' to connect to Agent Engine sessions.
+
+  - Use 'sqlite://<path_to_sqlite_file>' to connect to a SQLite DB.
+
+  - See https://docs.sqlalchemy.org/en/20/core/engines.html#backend-specific-urls for more details on supported DB URLs."""
     ),
 )
 @click.option(
@@ -360,6 +489,11 @@ def cli_web(
     default=False,
     help="Optional. Whether to enable cloud trace for telemetry.",
 )
+@click.option(
+    "--reload/--no-reload",
+    default=True,
+    help="Optional. Whether to enable auto reload for server.",
+)
 # The directory of agents, where each sub-directory is a single agent.
 # By default, it is the current working directory
 @click.argument(
@@ -377,8 +511,9 @@ def cli_api_server(
     allow_origins: Optional[list[str]] = None,
     port: int = 8000,
     trace_to_cloud: bool = False,
+    reload: bool = True,
 ):
-  """Start a FastAPI server for agents.
+  """Starts a FastAPI server for agents.
 
   AGENTS_DIR: The directory of agents, where each sub-directory is a single
   agent, containing at least `__init__.py` and `agent.py` files.
@@ -404,7 +539,7 @@ def cli_api_server(
       ),
       host="0.0.0.0",
       port=port,
-      reload=True,
+      reload=reload,
   )
   server = uvicorn.Server(config)
   server.run()
@@ -452,7 +587,7 @@ def cli_api_server(
     help="Optional. The port of the ADK API server (default: 8000).",
 )
 @click.option(
-    "--with_cloud_trace",
+    "--trace_to_cloud",
     type=bool,
     is_flag=True,
     show_default=True,
@@ -483,6 +618,26 @@ def cli_api_server(
         " (default: a timestamped folder in the system temp directory)."
     ),
 )
+@click.option(
+    "--verbosity",
+    type=click.Choice(
+        ["debug", "info", "warning", "error", "critical"], case_sensitive=False
+    ),
+    default="WARNING",
+    help="Optional. Override the default verbosity level.",
+)
+@click.option(
+    "--session_db_url",
+    help=(
+        """Optional. The database URL to store the session.
+
+  - Use 'agentengine://<agent_engine_resource_id>' to connect to Agent Engine sessions.
+
+  - Use 'sqlite://<path_to_sqlite_file>' to connect to a SQLite DB.
+
+  - See https://docs.sqlalchemy.org/en/20/core/engines.html#backend-specific-urls for more details on supported DB URLs."""
+    ),
+)
 @click.argument(
     "agent",
     type=click.Path(
@@ -497,8 +652,10 @@ def cli_deploy_cloud_run(
     app_name: str,
     temp_folder: str,
     port: int,
-    with_cloud_trace: bool,
+    trace_to_cloud: bool,
     with_ui: bool,
+    verbosity: str,
+    session_db_url: str,
 ):
   """Deploys an agent to Cloud Run.
 
@@ -517,8 +674,10 @@ def cli_deploy_cloud_run(
         app_name=app_name,
         temp_folder=temp_folder,
         port=port,
-        with_cloud_trace=with_cloud_trace,
+        trace_to_cloud=trace_to_cloud,
         with_ui=with_ui,
+        verbosity=verbosity,
+        session_db_url=session_db_url,
     )
   except Exception as e:
     click.secho(f"Deploy failed: {e}", fg="red", err=True)
