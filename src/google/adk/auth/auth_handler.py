@@ -82,7 +82,8 @@ class AuthHandler:
         or not auth_credential.oauth2
         or not auth_credential.oauth2.client_id
         or not auth_credential.oauth2.client_secret
-        or auth_credential.oauth2.token
+        or auth_credential.oauth2.access_token
+        or auth_credential.oauth2.refresh_token
     ):
       return self.auth_config.exchanged_auth_credential
 
@@ -93,7 +94,7 @@ class AuthHandler:
         redirect_uri=auth_credential.oauth2.redirect_uri,
         state=auth_credential.oauth2.state,
     )
-    token = client.fetch_token(
+    tokens = client.fetch_token(
         token_endpoint,
         authorization_response=auth_credential.oauth2.auth_response_uri,
         code=auth_credential.oauth2.auth_code,
@@ -102,13 +103,16 @@ class AuthHandler:
 
     updated_credential = AuthCredential(
         auth_type=AuthCredentialTypes.OAUTH2,
-        oauth2=OAuth2Auth(token=dict(token)),
+        oauth2=OAuth2Auth(
+            access_token=tokens.get("access_token"),
+            refresh_token=tokens.get("refresh_token"),
+        ),
     )
     return updated_credential
 
   def parse_and_store_auth_response(self, state: State) -> None:
 
-    credential_key = self.get_credential_key()
+    credential_key = "temp:" + self.auth_config.get_credential_key()
 
     state[credential_key] = self.auth_config.exchanged_auth_credential
     if not isinstance(
@@ -126,7 +130,7 @@ class AuthHandler:
       raise ValueError("auth_scheme is empty.")
 
   def get_auth_response(self, state: State) -> AuthCredential:
-    credential_key = self.get_credential_key()
+    credential_key = "temp:" + self.auth_config.get_credential_key()
     return state.get(credential_key, None)
 
   def generate_auth_request(self) -> AuthConfig:
@@ -187,29 +191,6 @@ class AuthHandler:
         raw_auth_credential=self.auth_config.raw_auth_credential,
         exchanged_auth_credential=exchanged_credential,
     )
-
-  def get_credential_key(self) -> str:
-    """Generates a unique key for the given auth scheme and credential."""
-    auth_scheme = self.auth_config.auth_scheme
-    auth_credential = self.auth_config.raw_auth_credential
-    if auth_scheme.model_extra:
-      auth_scheme = auth_scheme.model_copy(deep=True)
-      auth_scheme.model_extra.clear()
-    scheme_name = (
-        f"{auth_scheme.type_.name}_{hash(auth_scheme.model_dump_json())}"
-        if auth_scheme
-        else ""
-    )
-    if auth_credential.model_extra:
-      auth_credential = auth_credential.model_copy(deep=True)
-      auth_credential.model_extra.clear()
-    credential_name = (
-        f"{auth_credential.auth_type.value}_{hash(auth_credential.model_dump_json())}"
-        if auth_credential
-        else ""
-    )
-
-    return f"temp:adk_{scheme_name}_{credential_name}"
 
   def generate_auth_uri(
       self,

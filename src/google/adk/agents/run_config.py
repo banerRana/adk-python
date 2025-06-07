@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import field_validator
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('google_adk.' + __name__)
 
 
 class StreamingMode(Enum):
@@ -37,12 +37,13 @@ class RunConfig(BaseModel):
   model_config = ConfigDict(
       extra='forbid',
   )
+  """The pydantic model config."""
 
   speech_config: Optional[types.SpeechConfig] = None
   """Speech configuration for the live agent."""
 
   response_modalities: Optional[list[str]] = None
-  """The output modalities. If not set, its default to AUDIO."""
+  """The output modalities. If not set, it's default to AUDIO."""
 
   save_input_blobs_as_artifacts: bool = False
   """Whether or not to save the input blobs as artifacts."""
@@ -63,6 +64,9 @@ class RunConfig(BaseModel):
 
   output_audio_transcription: Optional[types.AudioTranscriptionConfig] = None
   """Output transcription for live agents with audio response."""
+
+  input_audio_transcription: Optional[types.AudioTranscriptionConfig] = None
+  """Input transcription for live agents with audio input from user."""
 
   max_llm_calls: int = 500
   """
