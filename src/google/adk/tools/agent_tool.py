@@ -21,10 +21,11 @@ from google.genai import types
 from pydantic import model_validator
 from typing_extensions import override
 
+from . import _automatic_function_calling_util
 from ..memory.in_memory_memory_service import InMemoryMemoryService
 from ..runners import Runner
 from ..sessions.in_memory_session_service import InMemorySessionService
-from . import _automatic_function_calling_util
+from ._forwarding_artifact_service import ForwardingArtifactService
 from .base_tool import BaseTool
 from .tool_context import ToolContext
 
@@ -45,10 +46,9 @@ class AgentTool(BaseTool):
     skip_summarization: Whether to skip summarization of the agent output.
   """
 
-  def __init__(self, agent: BaseAgent):
+  def __init__(self, agent: BaseAgent, skip_summarization: bool = False):
     self.agent = agent
-    self.skip_summarization: bool = False
-    """Whether to skip summarization of the agent output."""
+    self.skip_summarization: bool = skip_summarization
 
     super().__init__(name=agent.name, description=agent.description)
 
@@ -97,17 +97,6 @@ class AgentTool(BaseTool):
 
     if isinstance(self.agent, LlmAgent) and self.agent.input_schema:
       input_value = self.agent.input_schema.model_validate(args)
-    else:
-      input_value = args['request']
-
-    if isinstance(self.agent, LlmAgent) and self.agent.input_schema:
-      if isinstance(input_value, dict):
-        input_value = self.agent.input_schema.model_validate(input_value)
-      if not isinstance(input_value, self.agent.input_schema):
-        raise ValueError(
-            f'Input value {input_value} is not of type'
-            f' `{self.agent.input_schema}`.'
-        )
       content = types.Content(
           role='user',
           parts=[
@@ -119,18 +108,16 @@ class AgentTool(BaseTool):
     else:
       content = types.Content(
           role='user',
-          parts=[types.Part.from_text(text=input_value)],
+          parts=[types.Part.from_text(text=args['request'])],
       )
     runner = Runner(
         app_name=self.agent.name,
         agent=self.agent,
-        # TODO(kech): Remove the access to the invocation context.
-        #   It seems we don't need re-use artifact_service if we forward below.
-        artifact_service=tool_context._invocation_context.artifact_service,
+        artifact_service=ForwardingArtifactService(tool_context),
         session_service=InMemorySessionService(),
         memory_service=InMemoryMemoryService(),
     )
-    session = runner.session_service.create_session(
+    session = await runner.session_service.create_session(
         app_name=self.agent.name,
         user_id='tmp_user',
         state=tool_context.state.to_dict(),
@@ -145,32 +132,13 @@ class AgentTool(BaseTool):
         tool_context.state.update(event.actions.state_delta)
       last_event = event
 
-    if runner.artifact_service:
-      # Forward all artifacts to parent session.
-      for artifact_name in runner.artifact_service.list_artifact_keys(
-          app_name=session.app_name,
-          user_id=session.user_id,
-          session_id=session.id,
-      ):
-        if artifact := runner.artifact_service.load_artifact(
-            app_name=session.app_name,
-            user_id=session.user_id,
-            session_id=session.id,
-            filename=artifact_name,
-        ):
-          tool_context.save_artifact(filename=artifact_name, artifact=artifact)
-
-    if (
-        not last_event
-        or not last_event.content
-        or not last_event.content.parts
-        or not last_event.content.parts[0].text
-    ):
+    if not last_event or not last_event.content or not last_event.content.parts:
       return ''
+    merged_text = '\n'.join(p.text for p in last_event.content.parts if p.text)
     if isinstance(self.agent, LlmAgent) and self.agent.output_schema:
       tool_result = self.agent.output_schema.model_validate_json(
-          last_event.content.parts[0].text
+          merged_text
       ).model_dump(exclude_none=True)
     else:
-      tool_result = last_event.content.parts[0].text
+      tool_result = merged_text
     return tool_result

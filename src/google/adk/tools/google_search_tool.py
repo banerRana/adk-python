@@ -46,16 +46,15 @@ class GoogleSearchTool(BaseTool):
   ) -> None:
     llm_request.config = llm_request.config or types.GenerateContentConfig()
     llm_request.config.tools = llm_request.config.tools or []
-    if llm_request.model and llm_request.model.startswith('gemini-1'):
+    if llm_request.model and 'gemini-1' in llm_request.model:
       if llm_request.config.tools:
-        print(llm_request.config.tools)
         raise ValueError(
             'Google search tool can not be used with other tools in Gemini 1.x.'
         )
       llm_request.config.tools.append(
           types.Tool(google_search_retrieval=types.GoogleSearchRetrieval())
       )
-    elif llm_request.model and llm_request.model.startswith('gemini-2'):
+    elif llm_request.model and 'gemini-2' in llm_request.model:
       llm_request.config.tools.append(
           types.Tool(google_search=types.GoogleSearch())
       )
