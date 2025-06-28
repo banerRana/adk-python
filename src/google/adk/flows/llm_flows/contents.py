@@ -43,8 +43,16 @@ class _ContentLlmRequestProcessor(BaseLlmRequestProcessor):
     if not isinstance(agent, LlmAgent):
       return
 
-    if agent.include_contents != 'none':
+    if agent.include_contents == 'default':
+      # Include full conversation history
       llm_request.contents = _get_contents(
+          invocation_context.branch,
+          invocation_context.session.events,
+          agent.name,
+      )
+    else:
+      # Include current turn context only (no conversation history)
+      llm_request.contents = _get_current_turn_contents(
           invocation_context.branch,
           invocation_context.session.events,
           agent.name,
@@ -111,7 +119,7 @@ def _rearrange_events_for_latest_function_response(
   """Rearrange the events for the latest function_response.
 
   If the latest function_response is for an async function_call, all events
-  bewteen the initial function_call and the latest function_response will be
+  between the initial function_call and the latest function_response will be
   removed.
 
   Args:
@@ -170,10 +178,10 @@ def _rearrange_events_for_latest_function_response(
   for idx in range(function_call_event_idx + 1, len(events) - 1):
     event = events[idx]
     function_responses = event.get_function_responses()
-    if (
-        function_responses
-        and function_responses[0].id in function_responses_ids
-    ):
+    if function_responses and any([
+        function_response.id in function_responses_ids
+        for function_response in function_responses
+    ]):
       function_response_events.append(event)
   function_response_events.append(events[-1])
 
@@ -190,27 +198,36 @@ def _get_contents(
 ) -> list[types.Content]:
   """Get the contents for the LLM request.
 
+  Applies filtering, rearrangement, and content processing to events.
+
   Args:
     current_branch: The current branch of the agent.
-    events: A list of events.
+    events: Events to process.
     agent_name: The name of the agent.
 
   Returns:
-    A list of contents.
+    A list of processed contents.
   """
   filtered_events = []
   # Parse the events, leaving the contents and the function calls and
   # responses from the current agent.
   for event in events:
-    if not event.content or not event.content.role:
-      # Skip events without content, or generated neither by user nor by model.
+    if (
+        not event.content
+        or not event.content.role
+        or not event.content.parts
+        or event.content.parts[0].text == ''
+    ):
+      # Skip events without content, or generated neither by user nor by model
+      # or has empty text.
       # E.g. events purely for mutating session states.
+
       continue
     if not _is_event_belongs_to_branch(current_branch, event):
       # Skip events not belong to current branch.
       continue
     if _is_auth_event(event):
-      # skip auth event
+      # Skip auth events.
       continue
     filtered_events.append(
         _convert_foreign_event(event)
@@ -218,18 +235,52 @@ def _get_contents(
         else event
     )
 
+  # Rearrange events for proper function call/response pairing
   result_events = _rearrange_events_for_latest_function_response(
       filtered_events
   )
   result_events = _rearrange_events_for_async_function_responses_in_history(
       result_events
   )
+
+  # Convert events to contents
   contents = []
   for event in result_events:
     content = copy.deepcopy(event.content)
     remove_client_function_call_id(content)
     contents.append(content)
   return contents
+
+
+def _get_current_turn_contents(
+    current_branch: Optional[str], events: list[Event], agent_name: str = ''
+) -> list[types.Content]:
+  """Get contents for the current turn only (no conversation history).
+
+  When include_contents='none', we want to include:
+  - The current user input
+  - Tool calls and responses from the current turn
+  But exclude conversation history from previous turns.
+
+  In multi-agent scenarios, the "current turn" for an agent starts from an
+  actual user or from another agent.
+
+  Args:
+    current_branch: The current branch of the agent.
+    events: A list of all session events.
+    agent_name: The name of the agent.
+
+  Returns:
+    A list of contents for the current turn only, preserving context needed
+    for proper tool execution while excluding conversation history.
+  """
+  # Find the latest event that starts the current turn and process from there
+  for i in range(len(events) - 1, -1, -1):
+    event = events[i]
+    if event.author == 'user' or _is_other_agent_reply(agent_name, event):
+      return _get_contents(current_branch, events[i:], agent_name)
+
+  return []
 
 
 def _is_other_agent_reply(current_agent_name: str, event: Event) -> bool:
