@@ -35,7 +35,7 @@ def _walk_to_root_until_found(folder, filename) -> str:
 def load_dotenv_for_agent(
     agent_name: str, agent_parent_folder: str, filename: str = '.env'
 ):
-  """Lods the .env file for the agent module."""
+  """Loads the .env file for the agent module."""
 
   # Gets the folder of agent_module as starting_folder
   starting_folder = os.path.abspath(
@@ -49,9 +49,6 @@ def load_dotenv_for_agent(
         filename,
         agent_name,
         dotenv_file_path,
-    )
-    logger.info(
-        'Reloaded %s file for %s at %s', filename, agent_name, dotenv_file_path
     )
   else:
     logger.info('No %s file found for %s', filename, agent_name)
