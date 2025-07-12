@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """An artifact service implementation using Google Cloud Storage (GCS)."""
+from __future__ import annotations
 
 import logging
 from typing import Optional
@@ -23,7 +24,7 @@ from typing_extensions import override
 
 from .base_artifact_service import BaseArtifactService
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("google_adk." + __name__)
 
 
 class GcsArtifactService(BaseArtifactService):
@@ -77,7 +78,7 @@ class GcsArtifactService(BaseArtifactService):
     return f"{app_name}/{user_id}/{session_id}/{filename}/{version}"
 
   @override
-  def save_artifact(
+  async def save_artifact(
       self,
       *,
       app_name: str,
@@ -86,7 +87,7 @@ class GcsArtifactService(BaseArtifactService):
       filename: str,
       artifact: types.Part,
   ) -> int:
-    versions = self.list_versions(
+    versions = await self.list_versions(
         app_name=app_name,
         user_id=user_id,
         session_id=session_id,
@@ -107,7 +108,7 @@ class GcsArtifactService(BaseArtifactService):
     return version
 
   @override
-  def load_artifact(
+  async def load_artifact(
       self,
       *,
       app_name: str,
@@ -117,7 +118,7 @@ class GcsArtifactService(BaseArtifactService):
       version: Optional[int] = None,
   ) -> Optional[types.Part]:
     if version is None:
-      versions = self.list_versions(
+      versions = await self.list_versions(
           app_name=app_name,
           user_id=user_id,
           session_id=session_id,
@@ -141,7 +142,7 @@ class GcsArtifactService(BaseArtifactService):
     return artifact
 
   @override
-  def list_artifact_keys(
+  async def list_artifact_keys(
       self, *, app_name: str, user_id: str, session_id: str
   ) -> list[str]:
     filenames = set()
@@ -151,7 +152,7 @@ class GcsArtifactService(BaseArtifactService):
         self.bucket, prefix=session_prefix
     )
     for blob in session_blobs:
-      _, _, _, filename, _ = blob.name.split("/")
+      *_, filename, _ = blob.name.split("/")
       filenames.add(filename)
 
     user_namespace_prefix = f"{app_name}/{user_id}/user/"
@@ -159,16 +160,16 @@ class GcsArtifactService(BaseArtifactService):
         self.bucket, prefix=user_namespace_prefix
     )
     for blob in user_namespace_blobs:
-      _, _, _, filename, _ = blob.name.split("/")
+      *_, filename, _ = blob.name.split("/")
       filenames.add(filename)
 
     return sorted(list(filenames))
 
   @override
-  def delete_artifact(
+  async def delete_artifact(
       self, *, app_name: str, user_id: str, session_id: str, filename: str
   ) -> None:
-    versions = self.list_versions(
+    versions = await self.list_versions(
         app_name=app_name,
         user_id=user_id,
         session_id=session_id,
@@ -183,7 +184,7 @@ class GcsArtifactService(BaseArtifactService):
     return
 
   @override
-  def list_versions(
+  async def list_versions(
       self, *, app_name: str, user_id: str, session_id: str, filename: str
   ) -> list[int]:
     prefix = self._get_blob_name(app_name, user_id, session_id, filename, "")

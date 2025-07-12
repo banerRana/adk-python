@@ -14,11 +14,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-import random
-import string
 from typing import Optional
+import uuid
 
 from google.genai import types
+from pydantic import alias_generators
 from pydantic import ConfigDict
 from pydantic import Field
 
@@ -33,9 +33,10 @@ class Event(LlmResponse):
   taken by the agents like function calls, etc.
 
   Attributes:
-    invocation_id: The invocation ID of the event.
-    author: "user" or the name of the agent, indicating who appended the event
-      to the session.
+    invocation_id: Required. The invocation ID of the event. Should be non-empty
+      before appending to a session.
+    author: Required. "user" or the name of the agent, indicating who appended
+      the event to the session.
     actions: The actions taken by the agent.
     long_running_tool_ids: The ids of the long running function calls.
     branch: The branch of the event.
@@ -46,12 +47,16 @@ class Event(LlmResponse):
   """
 
   model_config = ConfigDict(
-      extra='forbid', ser_json_bytes='base64', val_json_bytes='base64'
+      extra='forbid',
+      ser_json_bytes='base64',
+      val_json_bytes='base64',
+      alias_generator=alias_generators.to_camel,
+      populate_by_name=True,
   )
+  """The pydantic model config."""
 
-  # TODO: revert to be required after spark migration
   invocation_id: str = ''
-  """The invocation ID of the event."""
+  """The invocation ID of the event. Should be non-empty before appending to a session."""
   author: str
   """'user' or the name of the agent, indicating who appended the event to the
   session."""
@@ -70,7 +75,7 @@ class Event(LlmResponse):
   agent_2, and agent_2 is the parent of agent_3.
 
   Branch is used when multiple sub-agent shouldn't see their peer agents'
-  conversaction history.
+  conversation history.
   """
 
   # The following are computed fields.
@@ -94,7 +99,7 @@ class Event(LlmResponse):
         not self.get_function_calls()
         and not self.get_function_responses()
         and not self.partial
-        and not self.has_trailing_code_exeuction_result()
+        and not self.has_trailing_code_execution_result()
     )
 
   def get_function_calls(self) -> list[types.FunctionCall]:
@@ -115,7 +120,7 @@ class Event(LlmResponse):
           func_response.append(part.function_response)
     return func_response
 
-  def has_trailing_code_exeuction_result(
+  def has_trailing_code_execution_result(
       self,
   ) -> bool:
     """Returns whether the event has a trailing code execution result."""
@@ -126,5 +131,4 @@ class Event(LlmResponse):
 
   @staticmethod
   def new_id():
-    characters = string.ascii_letters + string.digits
-    return ''.join(random.choice(characters) for _ in range(8))
+    return str(uuid.uuid4())
