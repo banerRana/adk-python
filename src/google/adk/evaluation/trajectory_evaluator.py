@@ -12,18 +12,133 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from __future__ import annotations
 
+from typing import Any
+from typing import Optional
+
+from google.genai import types as genai_types
 import pandas as pd
 from tabulate import tabulate
+from typing_extensions import deprecated
+from typing_extensions import override
 
+from .eval_case import Invocation
+from .eval_metrics import EvalMetric
+from .eval_metrics import Interval
+from .eval_metrics import MetricInfo
+from .eval_metrics import MetricValueInfo
+from .eval_metrics import PrebuiltMetrics
 from .evaluation_constants import EvalConstants
+from .evaluator import EvalStatus
+from .evaluator import EvaluationResult
+from .evaluator import Evaluator
+from .evaluator import PerInvocationResult
 
 
-class TrajectoryEvaluator:
+class TrajectoryEvaluator(Evaluator):
   """Evaluates tool use trajectories for accuracy."""
 
+  def __init__(
+      self,
+      threshold: Optional[float] = None,
+      eval_metric: Optional[EvalMetric] = None,
+  ):
+    if threshold is not None and eval_metric:
+      raise ValueError(
+          "Either eval_metric should be specified or threshold should be"
+          " specified."
+      )
+
+    if eval_metric:
+      threshold = eval_metric.threshold
+
+    self._threshold = threshold
+
   @staticmethod
+  def get_metric_info() -> MetricInfo:
+    return MetricInfo(
+        metric_name=PrebuiltMetrics.TOOL_TRAJECTORY_AVG_SCORE.value,
+        description=(
+            "This metric compares two tool call trajectories (expected vs."
+            " actual) for the same user interaction. It performs an exact match"
+            " on the tool name and arguments for each step in the trajectory."
+            " A score of 1.0 indicates a perfect match, while 0.0 indicates a"
+            " mismatch. Higher values are better."
+        ),
+        metric_value_info=MetricValueInfo(
+            interval=Interval(min_value=0.0, max_value=1.0)
+        ),
+    )
+
+  @override
+  def evaluate_invocations(
+      self,
+      actual_invocations: list[Invocation],
+      expected_invocations: list[Invocation],
+  ) -> EvaluationResult:
+    """Returns EvaluationResult after performing evaluations using actual and expected invocations."""
+    total_tool_use_accuracy = 0.0
+    num_invocations = 0
+    per_invocation_results = []
+
+    for actual, expected in zip(actual_invocations, expected_invocations):
+      actual_tool_uses = (
+          actual.intermediate_data.tool_uses if actual.intermediate_data else []
+      )
+      expected_tool_uses = (
+          expected.intermediate_data.tool_uses
+          if expected.intermediate_data
+          else []
+      )
+      tool_use_accuracy = (
+          1.0
+          if self._are_tool_calls_equal(actual_tool_uses, expected_tool_uses)
+          else 0.0
+      )
+      per_invocation_results.append(
+          PerInvocationResult(
+              actual_invocation=actual,
+              expected_invocation=expected,
+              score=tool_use_accuracy,
+              eval_status=self._get_eval_status(tool_use_accuracy),
+          )
+      )
+      total_tool_use_accuracy += tool_use_accuracy
+      num_invocations += 1
+
+    if per_invocation_results:
+      overall_score = total_tool_use_accuracy / num_invocations
+      return EvaluationResult(
+          overall_score=overall_score,
+          overall_eval_status=self._get_eval_status(overall_score),
+          per_invocation_results=per_invocation_results,
+      )
+
+    return EvaluationResult()
+
+  def _are_tool_calls_equal(
+      self,
+      actual_tool_calls: list[genai_types.FunctionCall],
+      expected_tool_calls: list[genai_types.FunctionCall],
+  ) -> bool:
+    if len(actual_tool_calls) != len(expected_tool_calls):
+      return False
+
+    for actual, expected in zip(actual_tool_calls, expected_tool_calls):
+      if actual.name != expected.name or actual.args != expected.args:
+        return False
+
+    return True
+
+  def _get_eval_status(self, score: float):
+    return EvalStatus.PASSED if score >= self._threshold else EvalStatus.FAILED
+
+  @staticmethod
+  @deprecated(
+      "This method has been deprecated and will be removed soon. Please use"
+      " evaluate_invocations instead."
+  )
   def evaluate(
       eval_dataset: list[list[dict[str, Any]]],
       *,
@@ -31,12 +146,11 @@ class TrajectoryEvaluator:
   ):
     r"""Returns the mean tool use accuracy of the eval dataset.
 
-    Tool use accuracy is calculated by comparing the expected and actuall tool
-    use trajectories. An exact match scores a 1, 0 otherwise. The final number
-    is an
-    average of these individual scores.
+    Tool use accuracy is calculated by comparing the expected and the actual
+    tool use trajectories. An exact match scores a 1, 0 otherwise. The final
+    number is an average of these individual scores.
 
-    Value range: [0, 1], where 0 is means none of the too use entries aligned,
+    Value range: [0, 1], where 0 means none of the tool use entries aligned,
     and 1 would mean all of them aligned. Higher value is good.
 
     Args:
@@ -45,7 +159,7 @@ class TrajectoryEvaluator:
         usually helpful during debugging.
 
     A note on eval_dataset:
-      The dataset should be a list session, where each sesssion is represented
+      The dataset should be a list session, where each session is represented
       as a list of interaction that need evaluation. Each evaluation is
       represented as a dictionary that is expected to have values for the
       following keys:
@@ -138,6 +252,10 @@ class TrajectoryEvaluator:
     return new_row, failure
 
   @staticmethod
+  @deprecated(
+      "are_tools_equal is deprecated and will be removed soon. Please use"
+      " TrajectoryEvaluator._are_tool_calls_equal instead."
+  )
   def are_tools_equal(list_a_original, list_b_original):
     # Remove other entries that we don't want to evaluate
     list_a = [

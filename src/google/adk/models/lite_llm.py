@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
 
 import base64
 import json
@@ -22,20 +23,26 @@ from typing import cast
 from typing import Dict
 from typing import Generator
 from typing import Iterable
+from typing import List
 from typing import Literal
 from typing import Optional
 from typing import Tuple
 from typing import Union
 
 from google.genai import types
+import litellm
 from litellm import acompletion
 from litellm import ChatCompletionAssistantMessage
+from litellm import ChatCompletionAssistantToolCall
 from litellm import ChatCompletionDeveloperMessage
+from litellm import ChatCompletionFileObject
+from litellm import ChatCompletionImageObject
 from litellm import ChatCompletionImageUrlObject
 from litellm import ChatCompletionMessageToolCall
 from litellm import ChatCompletionTextObject
 from litellm import ChatCompletionToolMessage
 from litellm import ChatCompletionUserMessage
+from litellm import ChatCompletionVideoObject
 from litellm import ChatCompletionVideoUrlObject
 from litellm import completion
 from litellm import CustomStreamWrapper
@@ -51,7 +58,10 @@ from .base_llm import BaseLlm
 from .llm_request import LlmRequest
 from .llm_response import LlmResponse
 
-logger = logging.getLogger(__name__)
+# This will add functions to prompts if functions are provided.
+litellm.add_function_to_prompt = True
+
+logger = logging.getLogger("google_adk." + __name__)
 
 _NEW_LINE = "\n"
 _EXCLUDED_PART_FIELD = {"inline_data": {"data"}}
@@ -61,10 +71,17 @@ class FunctionChunk(BaseModel):
   id: Optional[str]
   name: Optional[str]
   args: Optional[str]
+  index: Optional[int] = 0
 
 
 class TextChunk(BaseModel):
   text: str
+
+
+class UsageMetadataChunk(BaseModel):
+  prompt_tokens: int
+  completion_tokens: int
+  total_tokens: int
 
 
 class LiteLLMClient:
@@ -129,61 +146,83 @@ def _safe_json_serialize(obj) -> str:
 
   try:
     # Try direct JSON serialization first
-    return json.dumps(obj)
+    return json.dumps(obj, ensure_ascii=False)
   except (TypeError, OverflowError):
     return str(obj)
 
 
 def _content_to_message_param(
     content: types.Content,
-) -> Message:
-  """Converts a types.Content to a litellm Message.
+) -> Union[Message, list[Message]]:
+  """Converts a types.Content to a litellm Message or list of Messages.
+
+  Handles multipart function responses by returning a list of
+  ChatCompletionToolMessage objects if multiple function_response parts exist.
 
   Args:
     content: The content to convert.
 
   Returns:
-    The litellm Message.
+    A litellm Message, a list of litellm Messages.
   """
 
-  if content.parts and content.parts[0].function_response:
-    return ChatCompletionToolMessage(
-        role="tool",
-        tool_call_id=content.parts[0].function_response.id,
-        content=_safe_json_serialize(
-            content.parts[0].function_response.response
-        ),
-    )
+  tool_messages = []
+  for part in content.parts:
+    if part.function_response:
+      tool_messages.append(
+          ChatCompletionToolMessage(
+              role="tool",
+              tool_call_id=part.function_response.id,
+              content=_safe_json_serialize(part.function_response.response),
+          )
+      )
+  if tool_messages:
+    return tool_messages if len(tool_messages) > 1 else tool_messages[0]
 
+  # Handle user or assistant messages
   role = _to_litellm_role(content.role)
+  message_content = _get_content(content.parts) or None
 
   if role == "user":
-    return ChatCompletionUserMessage(
-        role="user", content=_get_content(content.parts)
-    )
-  else:
-
-    tool_calls = [
-        ChatCompletionMessageToolCall(
-            type="function",
-            id=part.function_call.id,
-            function=Function(
-                name=part.function_call.name,
-                arguments=part.function_call.args,
-            ),
+    return ChatCompletionUserMessage(role="user", content=message_content)
+  else:  # assistant/model
+    tool_calls = []
+    content_present = False
+    for part in content.parts:
+      if part.function_call:
+        tool_calls.append(
+            ChatCompletionAssistantToolCall(
+                type="function",
+                id=part.function_call.id,
+                function=Function(
+                    name=part.function_call.name,
+                    arguments=_safe_json_serialize(part.function_call.args),
+                ),
+            )
         )
-        for part in content.parts
-        if part.function_call
-    ]
+      elif part.text or part.inline_data:
+        content_present = True
+
+    final_content = message_content if content_present else None
+    if final_content and isinstance(final_content, list):
+      # when the content is a single text object, we can use it directly.
+      # this is needed for ollama_chat provider which fails if content is a list
+      final_content = (
+          final_content[0].get("text", "")
+          if final_content[0].get("type", None) == "text"
+          else final_content
+      )
 
     return ChatCompletionAssistantMessage(
         role=role,
-        content=_get_content(content.parts),
+        content=final_content,
         tool_calls=tool_calls or None,
     )
 
 
-def _get_content(parts: Iterable[types.Part]) -> OpenAIMessageContent | str:
+def _get_content(
+    parts: Iterable[types.Part],
+) -> Union[OpenAIMessageContent, str]:
   """Converts a list of parts to litellm content.
 
   Args:
@@ -213,17 +252,31 @@ def _get_content(parts: Iterable[types.Part]) -> OpenAIMessageContent | str:
       data_uri = f"data:{part.inline_data.mime_type};base64,{base64_string}"
 
       if part.inline_data.mime_type.startswith("image"):
+        # Extract format from mime type (e.g., "image/png" -> "png")
+        format_type = part.inline_data.mime_type.split("/")[-1]
         content_objects.append(
-            ChatCompletionImageUrlObject(
+            ChatCompletionImageObject(
                 type="image_url",
-                image_url=data_uri,
+                image_url=ChatCompletionImageUrlObject(
+                    url=data_uri, format=format_type
+                ),
             )
         )
       elif part.inline_data.mime_type.startswith("video"):
+        # Extract format from mime type (e.g., "video/mp4" -> "mp4")
+        format_type = part.inline_data.mime_type.split("/")[-1]
         content_objects.append(
-            ChatCompletionVideoUrlObject(
+            ChatCompletionVideoObject(
                 type="video_url",
-                video_url=data_uri,
+                video_url=ChatCompletionVideoUrlObject(
+                    url=data_uri, format=format_type
+                ),
+            )
+        )
+      elif part.inline_data.mime_type == "application/pdf":
+        content_objects.append(
+            ChatCompletionFileObject(
+                type="file", file={"file_data": data_uri, "format": "pdf"}
             )
         )
       else:
@@ -258,7 +311,9 @@ TYPE_LABELS = {
 
 
 def _schema_to_dict(schema: types.Schema) -> dict:
-  """Recursively converts a types.Schema to a dictionary.
+  """
+  Recursively converts a types.Schema to a pure-python dict
+  with all enum values written as lower-case strings.
 
   Args:
     schema: The schema to convert.
@@ -266,29 +321,40 @@ def _schema_to_dict(schema: types.Schema) -> dict:
   Returns:
     The dictionary representation of the schema.
   """
-
+  # Dump without json encoding so we still get Enum members
   schema_dict = schema.model_dump(exclude_none=True)
+
+  # ---- normalise this level ------------------------------------------------
   if "type" in schema_dict:
-    schema_dict["type"] = schema_dict["type"].lower()
+    # schema_dict["type"] can be an Enum or a str
+    t = schema_dict["type"]
+    schema_dict["type"] = (t.value if isinstance(t, types.Type) else t).lower()
+
+  # ---- recurse into `items` -----------------------------------------------
   if "items" in schema_dict:
-    if isinstance(schema_dict["items"], dict):
-      schema_dict["items"] = _schema_to_dict(
-          types.Schema.model_validate(schema_dict["items"])
-      )
-    elif isinstance(schema_dict["items"]["type"], types.Type):
-      schema_dict["items"]["type"] = TYPE_LABELS[
-          schema_dict["items"]["type"].value
-      ]
+    schema_dict["items"] = _schema_to_dict(
+        schema.items
+        if isinstance(schema.items, types.Schema)
+        else types.Schema.model_validate(schema_dict["items"])
+    )
+
+  # ---- recurse into `properties` ------------------------------------------
   if "properties" in schema_dict:
-    properties = {}
+    new_props = {}
     for key, value in schema_dict["properties"].items():
-      if isinstance(value, types.Schema):
-        properties[key] = _schema_to_dict(value)
+      # value is a dict → rebuild a Schema object and recurse
+      if isinstance(value, dict):
+        new_props[key] = _schema_to_dict(types.Schema.model_validate(value))
+      # value is already a Schema instance
+      elif isinstance(value, types.Schema):
+        new_props[key] = _schema_to_dict(value)
+      # plain dict without nested schemas
       else:
-        properties[key] = value
-        if "type" in properties[key]:
-          properties[key]["type"] = properties[key]["type"].lower()
-    schema_dict["properties"] = properties
+        new_props[key] = value
+        if "type" in new_props[key]:
+          new_props[key]["type"] = new_props[key]["type"].lower()
+    schema_dict["properties"] = new_props
+
   return schema_dict
 
 
@@ -330,15 +396,20 @@ def _function_declaration_to_tool_param(
 def _model_response_to_chunk(
     response: ModelResponse,
 ) -> Generator[
-    Tuple[Optional[Union[TextChunk, FunctionChunk]], Optional[str]], None, None
+    Tuple[
+        Optional[Union[TextChunk, FunctionChunk, UsageMetadataChunk]],
+        Optional[str],
+    ],
+    None,
+    None,
 ]:
-  """Converts a litellm message to text or function chunk.
+  """Converts a litellm message to text, function or usage metadata chunk.
 
   Args:
     response: The response from the model.
 
   Yields:
-    A tuple of text or function chunk and finish reason.
+    A tuple of text or function or usage metadata chunk and finish reason.
   """
 
   message = None
@@ -360,6 +431,7 @@ def _model_response_to_chunk(
               id=tool_call.id,
               name=tool_call.function.name,
               args=tool_call.function.arguments,
+              index=tool_call.index,
           ), finish_reason
 
     if finish_reason and not (
@@ -370,11 +442,21 @@ def _model_response_to_chunk(
   if not message:
     yield None, None
 
+  # Ideally usage would be expected with the last ModelResponseStream with a
+  # finish_reason set. But this is not the case we are observing from litellm.
+  # So we are sending it as a separate chunk to be set on the llm_response.
+  if response.get("usage", None):
+    yield UsageMetadataChunk(
+        prompt_tokens=response["usage"].get("prompt_tokens", 0),
+        completion_tokens=response["usage"].get("completion_tokens", 0),
+        total_tokens=response["usage"].get("total_tokens", 0),
+    ), None
+
 
 def _model_response_to_generate_content_response(
     response: ModelResponse,
 ) -> LlmResponse:
-  """Converts a litellm response to LlmResponse.
+  """Converts a litellm response to LlmResponse. Also adds usage metadata.
 
   Args:
     response: The model response.
@@ -389,7 +471,15 @@ def _model_response_to_generate_content_response(
 
   if not message:
     raise ValueError("No message in response")
-  return _message_to_generate_content_response(message)
+
+  llm_response = _message_to_generate_content_response(message)
+  if response.get("usage", None):
+    llm_response.usage_metadata = types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=response["usage"].get("prompt_tokens", 0),
+        candidates_token_count=response["usage"].get("completion_tokens", 0),
+        total_token_count=response["usage"].get("total_tokens", 0),
+    )
+  return llm_response
 
 
 def _message_to_generate_content_response(
@@ -426,19 +516,28 @@ def _message_to_generate_content_response(
 
 def _get_completion_inputs(
     llm_request: LlmRequest,
-) -> tuple[Iterable[Message], Iterable[dict]]:
-  """Converts an LlmRequest to litellm inputs.
+) -> Tuple[
+    List[Message],
+    Optional[List[Dict]],
+    Optional[types.SchemaUnion],
+    Optional[Dict],
+]:
+  """Converts an LlmRequest to litellm inputs and extracts generation params.
 
   Args:
     llm_request: The LlmRequest to convert.
 
   Returns:
-    The litellm inputs (message list and tool dictionary).
+    The litellm inputs (message list, tool dictionary, response format and generation params).
   """
-  messages = [
-      _content_to_message_param(content)
-      for content in llm_request.contents or []
-  ]
+  # 1. Construct messages
+  messages: List[Message] = []
+  for content in llm_request.contents or []:
+    message_param_or_list = _content_to_message_param(content)
+    if isinstance(message_param_or_list, list):
+      messages.extend(message_param_or_list)
+    elif message_param_or_list:  # Ensure it's not None before appending
+      messages.append(message_param_or_list)
 
   if llm_request.config.system_instruction:
     messages.insert(
@@ -449,7 +548,8 @@ def _get_completion_inputs(
         ),
     )
 
-  tools = None
+  # 2. Convert tool declarations
+  tools: Optional[List[Dict]] = None
   if (
       llm_request.config
       and llm_request.config.tools
@@ -459,7 +559,40 @@ def _get_completion_inputs(
         _function_declaration_to_tool_param(tool)
         for tool in llm_request.config.tools[0].function_declarations
     ]
-  return messages, tools
+
+  # 3. Handle response format
+  response_format: Optional[types.SchemaUnion] = None
+  if llm_request.config and llm_request.config.response_schema:
+    response_format = llm_request.config.response_schema
+
+  # 4. Extract generation parameters
+  generation_params: Optional[Dict] = None
+  if llm_request.config:
+    config_dict = llm_request.config.model_dump(exclude_none=True)
+    # Generate LiteLlm parameters here,
+    # Following https://docs.litellm.ai/docs/completion/input.
+    generation_params = {}
+    param_mapping = {
+        "max_output_tokens": "max_completion_tokens",
+        "stop_sequences": "stop",
+    }
+    for key in (
+        "temperature",
+        "max_output_tokens",
+        "top_p",
+        "top_k",
+        "stop_sequences",
+        "presence_penalty",
+        "frequency_penalty",
+    ):
+      if key in config_dict:
+        mapped_key = param_mapping.get(key, key)
+        generation_params[mapped_key] = config_dict[key]
+
+      if not generation_params:
+        generation_params = None
+
+  return messages, tools, response_format, generation_params
 
 
 def _build_function_declaration_log(
@@ -556,7 +689,6 @@ class LiteLlm(BaseLlm):
   Attributes:
     model: The name of the LiteLlm model.
     llm_client: The LLM client to use for the model.
-    model_config: The model config.
   """
 
   llm_client: LiteLLMClient = Field(default_factory=LiteLLMClient)
@@ -594,31 +726,60 @@ class LiteLlm(BaseLlm):
       LlmResponse: The model response.
     """
 
-    logger.info(_build_request_log(llm_request))
+    self._maybe_append_user_content(llm_request)
+    logger.debug(_build_request_log(llm_request))
 
-    messages, tools = _get_completion_inputs(llm_request)
+    messages, tools, response_format, generation_params = (
+        _get_completion_inputs(llm_request)
+    )
+
+    if "functions" in self._additional_args:
+      # LiteLLM does not support both tools and functions together.
+      tools = None
 
     completion_args = {
         "model": self.model,
         "messages": messages,
         "tools": tools,
+        "response_format": response_format,
     }
     completion_args.update(self._additional_args)
 
+    if generation_params:
+      completion_args.update(generation_params)
+
     if stream:
       text = ""
-      function_name = ""
-      function_args = ""
-      function_id = None
+      # Track function calls by index
+      function_calls = {}  # index -> {name, args, id}
       completion_args["stream"] = True
-      for part in self.llm_client.completion(**completion_args):
+      aggregated_llm_response = None
+      aggregated_llm_response_with_tool_call = None
+      usage_metadata = None
+      fallback_index = 0
+      async for part in await self.llm_client.acompletion(**completion_args):
         for chunk, finish_reason in _model_response_to_chunk(part):
           if isinstance(chunk, FunctionChunk):
+            index = chunk.index or fallback_index
+            if index not in function_calls:
+              function_calls[index] = {"name": "", "args": "", "id": None}
+
             if chunk.name:
-              function_name += chunk.name
+              function_calls[index]["name"] += chunk.name
             if chunk.args:
-              function_args += chunk.args
-            function_id = chunk.id or function_id
+              function_calls[index]["args"] += chunk.args
+
+              # check if args is completed (workaround for improper chunk
+              # indexing)
+              try:
+                json.loads(function_calls[index]["args"])
+                fallback_index += 1
+              except json.JSONDecodeError:
+                pass
+
+            function_calls[index]["id"] = (
+                chunk.id or function_calls[index]["id"] or str(index)
+            )
           elif isinstance(chunk, TextChunk):
             text += chunk.text
             yield _message_to_generate_content_response(
@@ -628,31 +789,60 @@ class LiteLlm(BaseLlm):
                 ),
                 is_partial=True,
             )
-          if finish_reason == "tool_calls" and function_id:
-            yield _message_to_generate_content_response(
-                ChatCompletionAssistantMessage(
-                    role="assistant",
-                    content="",
-                    tool_calls=[
-                        ChatCompletionMessageToolCall(
-                            type="function",
-                            id=function_id,
-                            function=Function(
-                                name=function_name,
-                                arguments=function_args,
-                            ),
-                        )
-                    ],
+          elif isinstance(chunk, UsageMetadataChunk):
+            usage_metadata = types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=chunk.prompt_tokens,
+                candidates_token_count=chunk.completion_tokens,
+                total_token_count=chunk.total_tokens,
+            )
+
+          if (
+              finish_reason == "tool_calls" or finish_reason == "stop"
+          ) and function_calls:
+            tool_calls = []
+            for index, func_data in function_calls.items():
+              if func_data["id"]:
+                tool_calls.append(
+                    ChatCompletionMessageToolCall(
+                        type="function",
+                        id=func_data["id"],
+                        function=Function(
+                            name=func_data["name"],
+                            arguments=func_data["args"],
+                            index=index,
+                        ),
+                    )
+                )
+            aggregated_llm_response_with_tool_call = (
+                _message_to_generate_content_response(
+                    ChatCompletionAssistantMessage(
+                        role="assistant",
+                        content=text,
+                        tool_calls=tool_calls,
+                    )
                 )
             )
-            function_name = ""
-            function_args = ""
-            function_id = None
+            text = ""
+            function_calls.clear()
           elif finish_reason == "stop" and text:
-            yield _message_to_generate_content_response(
+            aggregated_llm_response = _message_to_generate_content_response(
                 ChatCompletionAssistantMessage(role="assistant", content=text)
             )
             text = ""
+
+      # waiting until streaming ends to yield the llm_response as litellm tends
+      # to send chunk that contains usage_metadata after the chunk with
+      # finish_reason set to tool_calls or stop.
+      if aggregated_llm_response:
+        if usage_metadata:
+          aggregated_llm_response.usage_metadata = usage_metadata
+          usage_metadata = None
+        yield aggregated_llm_response
+
+      if aggregated_llm_response_with_tool_call:
+        if usage_metadata:
+          aggregated_llm_response_with_tool_call.usage_metadata = usage_metadata
+        yield aggregated_llm_response_with_tool_call
 
     else:
       response = await self.llm_client.acompletion(**completion_args)

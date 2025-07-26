@@ -62,6 +62,21 @@ class _BasicLlmRequestProcessor(BaseLlmRequestProcessor):
     llm_request.live_connect_config.output_audio_transcription = (
         invocation_context.run_config.output_audio_transcription
     )
+    llm_request.live_connect_config.input_audio_transcription = (
+        invocation_context.run_config.input_audio_transcription
+    )
+    llm_request.live_connect_config.realtime_input_config = (
+        invocation_context.run_config.realtime_input_config
+    )
+    llm_request.live_connect_config.enable_affective_dialog = (
+        invocation_context.run_config.enable_affective_dialog
+    )
+    llm_request.live_connect_config.proactivity = (
+        invocation_context.run_config.proactivity
+    )
+    llm_request.live_connect_config.session_resumption = (
+        invocation_context.run_config.session_resumption
+    )
 
     # TODO: handle tool append here, instead of in BaseTool.process_llm_request.
 
