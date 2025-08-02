@@ -12,11 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from abc import ABC, abstractmethod
+from __future__ import annotations
+
+from abc import ABC
+from abc import abstractmethod
 import base64
 import json
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from typing import Any
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Tuple
+from urllib.parse import parse_qs
+from urllib.parse import urlparse
+
 from google.auth import default as default_service_credential
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
@@ -317,7 +326,9 @@ class APIHubClient(BaseAPIHubClient):
         raise ValueError(f"Invalid service account JSON: {e}") from e
     else:
       try:
-        credentials, _ = default_service_credential()
+        credentials, _ = default_service_credential(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
       except:
         credentials = None
 

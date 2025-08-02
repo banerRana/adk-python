@@ -12,124 +12,103 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from __future__ import annotations
 
-import pandas as pd
-from tabulate import tabulate
-from vertexai.preview.evaluation import EvalTask
-from vertexai.preview.evaluation import MetricPromptTemplateExamples
+from typing import Optional
+
+from typing_extensions import override
+from vertexai import types as vertexai_types
+
+from .eval_case import Invocation
+from .eval_metrics import EvalMetric
+from .eval_metrics import Interval
+from .eval_metrics import MetricInfo
+from .eval_metrics import MetricValueInfo
+from .eval_metrics import PrebuiltMetrics
+from .evaluator import EvaluationResult
+from .evaluator import Evaluator
+from .final_response_match_v1 import RougeEvaluator
+from .vertex_ai_eval_facade import _VertexAiEvalFacade
 
 
-class ResponseEvaluator:
-  """Runs response evaluation for agents."""
+class ResponseEvaluator(Evaluator):
+  """Evaluates Agent's responses.
 
-  @staticmethod
-  def evaluate(
-      raw_eval_dataset: list[list[dict[str, Any]]],
-      evaluation_criteria: list[str],
-      *,
-      print_detailed_results: bool = False
+  This class supports two metrics:
+  1) response_evaluation_score
+  This metric evaluates how coherent agent's resposne was.
+
+  Value range of this metric is [1,5], with values closer to 5 more desirable.
+
+  2) response_match_score:
+  This metric evaluates if agent's final response matches a golden/expected
+  final response using Rouge_1 metric.
+
+  Value range for this metric is [0,1], with values closer to 1 more desirable.
+  """
+
+  def __init__(
+      self,
+      threshold: Optional[float] = None,
+      metric_name: Optional[str] = None,
+      eval_metric: Optional[EvalMetric] = None,
   ):
-    r"""Returns the value of requested evaluation metrics.
+    if (threshold is not None and eval_metric) or (
+        metric_name is not None and eval_metric
+    ):
+      raise ValueError(
+          "Either eval_metric should be specified or both threshold and"
+          " metric_name should be specified."
+      )
 
-    Args:
-      raw_eval_dataset: The dataset that will be evaluated.
-      evaluation_criteria: The evaluation criteria to be used. This method
-        support two criterias, `response_evaluation_score` and
-        `response_match_score`.
-      print_detailed_results: Prints detailed results on the console. This is
-        usually helpful during debugging.
+    if eval_metric:
+      threshold = eval_metric.threshold
+      metric_name = eval_metric.metric_name
 
-    A note on evaluation_criteria:
-      `response_match_score`: This metric compares the agents final natural
-        language response with the expected final response, stored in the
-        "reference" field in test/eval files. We use Rouge metric to compare the
-        two responses.
+    if PrebuiltMetrics.RESPONSE_EVALUATION_SCORE.value == metric_name:
+      self._metric_name = vertexai_types.PrebuiltMetric.COHERENCE
+    elif PrebuiltMetrics.RESPONSE_MATCH_SCORE.value == metric_name:
+      self._metric_name = metric_name
+    else:
+      raise ValueError(f"`{metric_name}` is not supported.")
 
-        Value Range: [0, 1]. A score closer to 0 means poor similarity between
-          response and reference. A score closer to 1 means strong similarity
-          between response and reference.
-
-      `response_evaluation_score`: Uses LLM to evalaute coherence of the
-        response, including tool use. This is pointwise metric.
-
-        Value range: [0, 5], where 0 means that the agent's response is not
-        coherent, while 5 means it is . High values are good.
-    A note on raw_eval_dataset:
-      The dataset should be a list session, where each sesssion is represented
-      as a list of interaction that need evaluation. Each evaluation is
-      represented as a dictionary that is expected to have values for the
-      following keys:
-
-        1) query
-        2) response
-        3) acutal_tool_use
-        4) expected_tool_use
-        5) reference
-
-      Here is a sample eval_dataset value with one entry:
-      [
-        [
-          {
-            "query": "roll a die for me",
-            "response": "I rolled a 16 sided die and got 13.\n",
-            "expected_tool_use": [
-              {
-                "tool_name": "roll_die",
-                "tool_input": {
-                  "sides": 16
-                }
-              }
-            ],
-            "acutal_tool_use": [
-              {
-                "tool_name": "roll_die",
-                "tool_input": {
-                  "sides": 16
-                }
-              }
-            ],
-            "reference": "I rolled a 16 sided die and got 13.\n"
-          }
-        ]
-      ]
-    """
-    if not raw_eval_dataset:
-      raise ValueError("The evaluation dataset is empty.")
-
-    metrics = ResponseEvaluator._get_metrics(
-        raw_eval_dataset, evaluation_criteria
-    )
-    flattened_queries = [
-        item for sublist in raw_eval_dataset for item in sublist
-    ]
-    eval_dataset = pd.DataFrame(flattened_queries).rename(
-        columns={"query": "prompt", "expected_tool_use": "reference_trajectory"}
-    )
-    eval_task = EvalTask(dataset=eval_dataset, metrics=metrics)
-
-    eval_result = eval_task.evaluate()
-    if print_detailed_results:
-      ResponseEvaluator._print_results(eval_result)
-    return eval_result.summary_metrics
+    self._threshold = threshold
 
   @staticmethod
-  def _get_metrics(raw_eval_dataset, criteria):
-    metrics = []
-    if (
-        "response_evaluation_score" in criteria
-        and "query" in raw_eval_dataset[0][0]
-        and "expected_tool_use" in raw_eval_dataset[0][0]
-    ):
-      metrics.append(MetricPromptTemplateExamples.Pointwise.COHERENCE)
-    if (
-        "response_match_score" in criteria
-        and "reference" in raw_eval_dataset[0][0]
-    ):
-      metrics.append("rouge_1")
-    return metrics
+  def get_metric_info(metric_name: str) -> MetricInfo:
+    """Returns MetricInfo for the given metric name."""
+    if PrebuiltMetrics.RESPONSE_EVALUATION_SCORE.value == metric_name:
+      return MetricInfo(
+          metric_name=PrebuiltMetrics.RESPONSE_EVALUATION_SCORE.value,
+          description=(
+              "This metric evaluates how coherent agent's resposne was. Value"
+              " range of this metric is [1,5], with values closer to 5 more"
+              " desirable."
+          ),
+          metric_value_info=MetricValueInfo(
+              interval=Interval(min_value=1.0, max_value=5.0)
+          ),
+      )
+    elif PrebuiltMetrics.RESPONSE_MATCH_SCORE.value == metric_name:
+      return RougeEvaluator.get_metric_info()
+    else:
+      raise ValueError(f"`{metric_name}` is not supported.")
 
-  @staticmethod
-  def _print_results(eval_result):
-    print("Evaluation Summary Metrics:", eval_result.summary_metrics)
-    print(tabulate(eval_result.metrics_table, headers="keys", tablefmt="grid"))
+  @override
+  def evaluate_invocations(
+      self,
+      actual_invocations: list[Invocation],
+      expected_invocations: list[Invocation],
+  ) -> EvaluationResult:
+    # If the metric is response_match_score, just use the RougeEvaluator.
+    if self._metric_name == PrebuiltMetrics.RESPONSE_MATCH_SCORE.value:
+      rouge_evaluator = RougeEvaluator(
+          EvalMetric(metric_name=self._metric_name, threshold=self._threshold)
+      )
+      return rouge_evaluator.evaluate_invocations(
+          actual_invocations, expected_invocations
+      )
+
+    return _VertexAiEvalFacade(
+        threshold=self._threshold, metric_name=self._metric_name
+    ).evaluate_invocations(actual_invocations, expected_invocations)

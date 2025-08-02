@@ -12,10 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from .tool_context import ToolContext
 
 
-# TODO: make this internal, since user doesn't need to use this tool directly.
-def transfer_to_agent(agent_name: str, tool_context: ToolContext):
-  """Transfer the question to another agent."""
+def transfer_to_agent(agent_name: str, tool_context: ToolContext) -> None:
+  """Transfer the question to another agent.
+
+  This tool hands off control to another agent when it's more suitable to
+  answer the user's question according to the agent's description.
+
+  Args:
+    agent_name: the agent name to transfer to.
+  """
   tool_context.actions.transfer_to_agent = agent_name

@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Forked from google3/third_party/py/google/genai/_automatic_function_calling_util.py temporarily."""
+from __future__ import annotations
 
 import inspect
 from types import FunctionType
+import typing
 from typing import Any
 from typing import Callable
 from typing import Dict
-from typing import Literal
 from typing import Optional
 from typing import Union
 
@@ -29,7 +29,8 @@ from pydantic import BaseModel
 from pydantic import create_model
 from pydantic import fields as pydantic_fields
 
-from . import function_parameter_parse_util
+from . import _function_parameter_parse_util
+from ..utils.variant_utils import GoogleLLMVariant
 
 _py_type_2_schema_type = {
     'str': types.Type.STRING,
@@ -193,7 +194,7 @@ def _get_return_type(func: Callable) -> Any:
 def build_function_declaration(
     func: Union[Callable, BaseModel],
     ignore_params: Optional[list[str]] = None,
-    variant: Literal['GOOGLE_AI', 'VERTEX_AI', 'DEFAULT'] = 'GOOGLE_AI',
+    variant: GoogleLLMVariant = GoogleLLMVariant.GEMINI_API,
 ) -> types.FunctionDeclaration:
   signature = inspect.signature(func)
   should_update_signature = False
@@ -227,6 +228,8 @@ def build_function_declaration(
           func.__closure__,
       )
       new_func.__signature__ = new_sig
+      new_func.__doc__ = func.__doc__
+      new_func.__annotations__ = func.__annotations__
 
   return (
       from_function_with_options(func, variant)
@@ -289,15 +292,8 @@ def build_function_declaration_util(
 
 def from_function_with_options(
     func: Callable,
-    variant: Literal['GOOGLE_AI', 'VERTEX_AI', 'DEFAULT'] = 'GOOGLE_AI',
+    variant: GoogleLLMVariant = GoogleLLMVariant.GEMINI_API,
 ) -> 'types.FunctionDeclaration':
-
-  supported_variants = ['GOOGLE_AI', 'VERTEX_AI', 'DEFAULT']
-  if variant not in supported_variants:
-    raise ValueError(
-        f'Unsupported variant: {variant}. Supported variants are:'
-        f' {", ".join(supported_variants)}'
-    )
 
   parameters_properties = {}
   for name, param in inspect.signature(func).parameters.items():
@@ -306,7 +302,11 @@ def from_function_with_options(
         inspect.Parameter.KEYWORD_ONLY,
         inspect.Parameter.POSITIONAL_ONLY,
     ):
-      schema = function_parameter_parse_util._parse_schema_from_parameter(
+      # This snippet catches the case when type hints are stored as strings
+      if isinstance(param.annotation, str):
+        param = param.replace(annotation=typing.get_type_hints(func)[name])
+
+      schema = _function_parameter_parse_util._parse_schema_from_parameter(
           variant, param, func.__name__
       )
       parameters_properties[name] = schema
@@ -319,27 +319,69 @@ def from_function_with_options(
         type='OBJECT',
         properties=parameters_properties,
     )
-    if variant == 'VERTEX_AI':
-      declaration.parameters.required = (
-          function_parameter_parse_util._get_required_fields(
-              declaration.parameters
-          )
-      )
-  if not variant == 'VERTEX_AI':
+    declaration.parameters.required = (
+        _function_parameter_parse_util._get_required_fields(
+            declaration.parameters
+        )
+    )
+  if variant == GoogleLLMVariant.GEMINI_API:
     return declaration
 
   return_annotation = inspect.signature(func).return_annotation
+
+  # Handle functions with no return annotation
   if return_annotation is inspect._empty:
+    # Functions with no return annotation can return any type
+    return_value = inspect.Parameter(
+        'return_value',
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        annotation=typing.Any,
+    )
+    declaration.response = (
+        _function_parameter_parse_util._parse_schema_from_parameter(
+            variant,
+            return_value,
+            func.__name__,
+        )
+    )
     return declaration
 
+  # Handle functions that explicitly return None
+  if (
+      return_annotation is None
+      or return_annotation is type(None)
+      or (isinstance(return_annotation, str) and return_annotation == 'None')
+  ):
+    # Create a response schema for None/null return
+    return_value = inspect.Parameter(
+        'return_value',
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        annotation=None,
+    )
+    declaration.response = (
+        _function_parameter_parse_util._parse_schema_from_parameter(
+            variant,
+            return_value,
+            func.__name__,
+        )
+    )
+    return declaration
+
+  return_value = inspect.Parameter(
+      'return_value',
+      inspect.Parameter.POSITIONAL_OR_KEYWORD,
+      annotation=return_annotation,
+  )
+  # This snippet catches the case when type hints are stored as strings
+  if isinstance(return_value.annotation, str):
+    return_value = return_value.replace(
+        annotation=typing.get_type_hints(func)['return']
+    )
+
   declaration.response = (
-      function_parameter_parse_util._parse_schema_from_parameter(
+      _function_parameter_parse_util._parse_schema_from_parameter(
           variant,
-          inspect.Parameter(
-              'return_value',
-              inspect.Parameter.POSITIONAL_OR_KEYWORD,
-              annotation=return_annotation,
-          ),
+          return_value,
           func.__name__,
       )
   )

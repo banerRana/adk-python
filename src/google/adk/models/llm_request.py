@@ -37,7 +37,7 @@ class LlmRequest(BaseModel):
   """
 
   model_config = ConfigDict(arbitrary_types_allowed=True)
-  """The model config."""
+  """The pydantic model config."""
 
   model: Optional[str] = None
   """The model name."""
@@ -45,7 +45,9 @@ class LlmRequest(BaseModel):
   contents: list[types.Content] = Field(default_factory=list)
   """The contents to send to the model."""
 
-  config: Optional[types.GenerateContentConfig] = None
+  config: types.GenerateContentConfig = Field(
+      default_factory=types.GenerateContentConfig
+  )
   live_connect_config: types.LiveConnectConfig = types.LiveConnectConfig()
   """Additional config for the generate content request.
 

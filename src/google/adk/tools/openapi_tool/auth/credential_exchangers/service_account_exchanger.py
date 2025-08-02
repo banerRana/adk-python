@@ -14,6 +14,8 @@
 
 """Credential fetcher for Google Service Account."""
 
+from __future__ import annotations
+
 from typing import Optional
 
 import google.auth
@@ -21,14 +23,13 @@ from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 import google.oauth2.credentials
 
-from .....auth.auth_credential import (
-    AuthCredential,
-    AuthCredentialTypes,
-    HttpAuth,
-    HttpCredentials,
-)
+from .....auth.auth_credential import AuthCredential
+from .....auth.auth_credential import AuthCredentialTypes
+from .....auth.auth_credential import HttpAuth
+from .....auth.auth_credential import HttpCredentials
 from .....auth.auth_schemes import AuthScheme
-from .base_credential_exchanger import AuthCredentialMissingError, BaseAuthCredentialExchanger
+from .base_credential_exchanger import AuthCredentialMissingError
+from .base_credential_exchanger import BaseAuthCredentialExchanger
 
 
 class ServiceAccountCredentialExchanger(BaseAuthCredentialExchanger):
@@ -73,7 +74,9 @@ class ServiceAccountCredentialExchanger(BaseAuthCredentialExchanger):
 
     try:
       if auth_credential.service_account.use_default_credential:
-        credentials, _ = google.auth.default()
+        credentials, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
       else:
         config = auth_credential.service_account
         credentials = service_account.Credentials.from_service_account_info(

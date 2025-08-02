@@ -14,7 +14,8 @@
 
 from __future__ import annotations
 
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
+from typing import TYPE_CHECKING
 
 from typing_extensions import override
 
@@ -23,7 +24,8 @@ from .readonly_context import ReadonlyContext
 if TYPE_CHECKING:
   from google.genai import types
 
-  from ..events.event import Event
+  from ..auth.auth_credential import AuthCredential
+  from ..auth.auth_tool import AuthConfig
   from ..events.event_actions import EventActions
   from ..sessions.state import State
   from .invocation_context import InvocationContext
@@ -61,12 +63,7 @@ class CallbackContext(ReadonlyContext):
     """
     return self._state
 
-  @property
-  def user_content(self) -> Optional[types.Content]:
-    """The user content that started this invocation. READONLY field."""
-    return self._invocation_context.user_content
-
-  def load_artifact(
+  async def load_artifact(
       self, filename: str, version: Optional[int] = None
   ) -> Optional[types.Part]:
     """Loads an artifact attached to the current session.
@@ -81,7 +78,7 @@ class CallbackContext(ReadonlyContext):
     """
     if self._invocation_context.artifact_service is None:
       raise ValueError("Artifact service is not initialized.")
-    return self._invocation_context.artifact_service.load_artifact(
+    return await self._invocation_context.artifact_service.load_artifact(
         app_name=self._invocation_context.app_name,
         user_id=self._invocation_context.user_id,
         session_id=self._invocation_context.session.id,
@@ -89,7 +86,7 @@ class CallbackContext(ReadonlyContext):
         version=version,
     )
 
-  def save_artifact(self, filename: str, artifact: types.Part) -> int:
+  async def save_artifact(self, filename: str, artifact: types.Part) -> int:
     """Saves an artifact and records it as delta for the current session.
 
     Args:
@@ -101,7 +98,7 @@ class CallbackContext(ReadonlyContext):
     """
     if self._invocation_context.artifact_service is None:
       raise ValueError("Artifact service is not initialized.")
-    version = self._invocation_context.artifact_service.save_artifact(
+    version = await self._invocation_context.artifact_service.save_artifact(
         app_name=self._invocation_context.app_name,
         user_id=self._invocation_context.user_id,
         session_id=self._invocation_context.session.id,
@@ -110,3 +107,42 @@ class CallbackContext(ReadonlyContext):
     )
     self._event_actions.artifact_delta[filename] = version
     return version
+
+  async def list_artifacts(self) -> list[str]:
+    """Lists the filenames of the artifacts attached to the current session."""
+    if self._invocation_context.artifact_service is None:
+      raise ValueError("Artifact service is not initialized.")
+    return await self._invocation_context.artifact_service.list_artifact_keys(
+        app_name=self._invocation_context.app_name,
+        user_id=self._invocation_context.user_id,
+        session_id=self._invocation_context.session.id,
+    )
+
+  async def save_credential(self, auth_config: AuthConfig) -> None:
+    """Saves a credential to the credential service.
+
+    Args:
+      auth_config: The authentication configuration containing the credential.
+    """
+    if self._invocation_context.credential_service is None:
+      raise ValueError("Credential service is not initialized.")
+    await self._invocation_context.credential_service.save_credential(
+        auth_config, self
+    )
+
+  async def load_credential(
+      self, auth_config: AuthConfig
+  ) -> Optional[AuthCredential]:
+    """Loads a credential from the credential service.
+
+    Args:
+      auth_config: The authentication configuration for the credential.
+
+    Returns:
+      The loaded credential, or None if not found.
+    """
+    if self._invocation_context.credential_service is None:
+      raise ValueError("Credential service is not initialized.")
+    return await self._invocation_context.credential_service.load_credential(
+        auth_config, self
+    )
